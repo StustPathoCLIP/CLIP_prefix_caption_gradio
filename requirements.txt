@@ -1,0 +1,6 @@
+ transformers
+gradio
+clip-by-openai
+Pillow
+numpy
+tqdm

@@ -26,6 +26,7 @@ try:
 except ImportError:
     parse_coco = None
 
+model_directory = "pt_model"
 
 class ImageCaptioningApp:
     """
@@ -43,6 +44,7 @@ class ImageCaptioningApp:
             "prefix_length": None,
             "model_path": None
         }
+
 
     # ===============  1. 推理  ===============
     def get_local_models(self, directory="pt_model"):
@@ -102,7 +104,7 @@ class ImageCaptioningApp:
             yield log
             return
 
-        model_path = self.get_model_path(model_selection, custom_model_path)
+        model_path = self.get_model_path(os.path.join(model_directory, model_selection), custom_model_path)
 
         # 2) 檢查模型檔案路徑
         if not os.path.isfile(model_path):
@@ -676,8 +678,8 @@ def create_gradio_interface(app: ImageCaptioningApp):
 
                     with gr.Column():
                         model_selection = gr.Dropdown(
-                            choices=app.get_local_models(),
-                            value=("自定義路徑" if not app.get_local_models() else app.get_local_models()[0]),
+                            choices=app.get_local_models(directory = "pt_model"),
+                            value=("自定義路徑" if not app.get_local_models(directory = "pt_model") else app.get_local_models(directory = "pt_model")[0]),
                             label="選擇本地模型"
                         )
                         custom_model_path = gr.Textbox(

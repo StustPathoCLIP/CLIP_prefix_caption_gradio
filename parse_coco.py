@@ -12,30 +12,68 @@ def parse_coco_gen(input_dir: str, output_dir: str, clip_model_type: str):
     """
     與原本 parse_coco 類似，但改為 generator。
     每處理部分資料就回傳 (i, total, msg)，讓上層可自訂如何顯示。
+    
+    新增支援自己的數據：當 annotations 資料夾內存在 "train_caption_tcgaCOAD.json" 時，
+    表示使用自己的數據，其 JSON 格式為：
+    
+    [
+        {
+            "image_id": "TCGA-3L-AA1B-1",
+            "id": 1,
+            "caption": "..."
+        },
+        ...
+    ]
+    
+    此時對應的圖片檔案位置為：
+        train/<folder>/<image_id>.jpg
+    例如：image_id "TCGA-3L-AA1B-1" 對應的路徑為 "train/TCGA-3L-AA1B/TCGA-3L-AA1B-1.jpg"
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     clip_model, preprocess = clip.load(clip_model_type, device=device, jit=False)
+    
+    # 判斷使用哪個 annotation 文件
+    tcga_annotation_path = os.path.join(input_dir, 'annotations', 'train_caption_tcgaCOAD.json')
+    coco_annotation_path = os.path.join(input_dir, 'annotations', 'train_caption.json')
+    if os.path.isfile(tcga_annotation_path):
+        captions_path = tcga_annotation_path
+        dataset_type = 'tcga'
+    else:
+        captions_path = coco_annotation_path
+        dataset_type = 'coco'
 
-    captions_path = os.path.join(input_dir, 'annotations', 'train_caption.json')
     with open(captions_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
     total = len(data)
     yield (0, total, f"載入 {total} 筆 captions：{captions_path}\n")
     yield (0, total, f"使用 CLIP 模型：{clip_model_type}\n")
+    yield (0, total, f"資料集類型：{dataset_type}\n")
 
     all_embeddings = []
     all_captions = []
-
     start_time = time.time()
 
     for i, d in enumerate(data, start=1):
         img_id = d["image_id"]
 
-        # train2014 / val2014
-        filename = os.path.join(input_dir, 'train2014', f"COCO_train2014_{int(img_id):012d}.jpg")
+        if dataset_type == 'tcga':
+            # 根據 image_id 取得子資料夾名稱（去除最後一個 '-' 後的部分）
+            folder_name = img_id.rsplit("-", 1)[0]
+            filename = os.path.join(input_dir, "train", folder_name, f"{img_id}.jpg")
+        else:
+            # COCO 資料集處理：先找 train2014，再找 val2014
+            try:
+                int_img_id = int(img_id)
+            except ValueError:
+                int_img_id = 0
+            filename = os.path.join(input_dir, 'train2014', f"COCO_train2014_{int_img_id:012d}.jpg")
+            if not os.path.isfile(filename):
+                filename = os.path.join(input_dir, 'val2014', f"COCO_val2014_{int_img_id:012d}.jpg")
+
         if not os.path.isfile(filename):
-            filename = os.path.join(input_dir, 'val2014', f"COCO_val2014_{int(img_id):012d}.jpg")
+            yield (i, total, f"警告: 找不到圖片檔案 {filename}\n")
+            continue
 
         image = Image.open(filename).convert("RGB")
         image_tensor = preprocess(image).unsqueeze(0).to(device)
@@ -56,7 +94,6 @@ def parse_coco_gen(input_dir: str, output_dir: str, clip_model_type: str):
     # 全部處理完成
     model_name_sanitized = clip_model_type.replace('/', '_')
     out_path = os.path.join(output_dir, f"oscar_split_{model_name_sanitized}_train.pkl")
-
     with open(out_path, 'wb') as f:
         pickle.dump({
             "clip_embedding": torch.cat(all_embeddings, dim=0),

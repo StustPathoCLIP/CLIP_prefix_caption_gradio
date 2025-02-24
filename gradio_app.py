@@ -434,10 +434,11 @@ class ImageCaptioningApp:
         print(f"解壓完成: {zip_path} 至 {dest_dir}")
 
     # 2-2 前處理 parse_coco
-    def parse_coco_data(self, input_dir: str, output_dir: str, clip_model_type: str):
+    def parse_coco_data(self, input_dir: str, output_dir: str, clip_model_type: str, data_type: str):
         """
         1) 呼叫 parse_coco_gen(...)，逐筆取得 (i, total, msg)
         2) 本函式用 stable_log + progress_line 的做法顯示
+        3) 新增 data_type (COCO / TCGA)，若使用者沒輸入路徑，就依 data_type 設置預設值
         """
         stable_log = ""
         progress_line = ""
@@ -446,15 +447,23 @@ class ImageCaptioningApp:
         stable_log += "=== 開始 parse_coco ===\n"
         yield stable_log
 
-        # 若使用者沒輸入路徑，使用預設
+        # 根據 data_type 決定預設路徑
         if not input_dir.strip():
-            input_dir = "./data/coco"
+            if data_type == "TCGA":
+                input_dir = "./data/tcga"
+            else:
+                input_dir = "./data/coco"
+
         if not output_dir.strip():
-            output_dir = "./data/coco"
+            if data_type == "TCGA":
+                output_dir = "./data/tcga"
+            else:
+                output_dir = "./data/coco"
 
         stable_log += f"使用 Input dir: {input_dir}\n"
         stable_log += f"使用 Output dir: {output_dir}\n"
         stable_log += f"Clip Model Type: {clip_model_type}\n"
+        stable_log += f"數據類型: {data_type}\n"
         yield stable_log
 
         try:
@@ -465,19 +474,13 @@ class ImageCaptioningApp:
             return
 
         try:
-            # 逐條接收 parse_coco_gen(...) 的 (i, total, msg)
             gen = parse_coco_gen(input_dir, output_dir, clip_model_type)
             for (i, total, partial_msg) in gen:
-                # i, total => 用來計算%或進度
                 pct = (i / total) * 100 if total > 0 else 0
-
-                # 進度條行
                 progress_line = f"目前進度：{i}/{total} (約 {pct:.2f}%)\n"
                 progress_line += partial_msg
-
                 yield stable_log + "\n" + progress_line
 
-            # 結束
             stable_log += "【成功】parse_coco 完成！\n"
             yield stable_log
 
@@ -485,6 +488,7 @@ class ImageCaptioningApp:
             stable_log += f"【失敗】parse_coco 過程中出現錯誤：{str(e)}\n"
             yield stable_log
             return
+
 
     # 2-3 執行訓練
     def run_training(
@@ -614,6 +618,33 @@ class ImageCaptioningApp:
             yield log
             return
 
+def update_parse_instructions(data_type):
+    """
+    根據用戶選擇的數據類型返回相應的指導說明。
+    """
+    if data_type == "TCGA":
+        return (
+            "【注意】您選擇的是 TCGA 數據，請確保：\n"
+            "1. JSON 文件命名為 **train_caption_tcgaCOAD.json** 並放在 annotations 資料夾中；\n"
+            "2. 圖片存放格式必須為 **train/<folder>/<image_id>.jpg**，例如：\n"
+            "   TCGA-3L-AA1B-1 對應 train/TCGA-3L-AA1B/TCGA-3L-AA1B-1.jpg"
+        )
+    else:
+        return (
+            "【注意】您選擇的是 COCO 數據，請確保數據格式符合 COCO 標準，\n"
+            "並確認 annotations 資料夾中存在 **train_caption.json**。"
+        )
+
+def update_data_path_placeholders(data_type):
+    """
+    根據數據類型更新「資料路徑」及「輸出 pkl 目錄」的 placeholder。
+    當選擇 TCGA 時，預設為 "./data/tcga"；否則為 "./data/coco"。
+    """
+    if data_type == "TCGA":
+        return gr.update(placeholder="./data/tcga"), gr.update(placeholder="./data/tcga")
+    else:
+        return gr.update(placeholder="./data/coco"), gr.update(placeholder="./data/coco")
+
 def create_gradio_interface(app: ImageCaptioningApp):
     """建立 Gradio 前端介面：包含推理、訓練（使用COCO格式的數據或自定義數據）兩大功能。"""
 
@@ -630,7 +661,7 @@ def create_gradio_interface(app: ImageCaptioningApp):
 
     with gr.Blocks() as demo:
         gr.Markdown("# CLIP_prefix_caption")
-        gr.Markdown("本系統提供 **推理** 和 **訓練** ，您可以使用COCO格式的數據或您自己的數據進行訓練。")
+        gr.Markdown("本系統提供 **推理** 和 **訓練** ，您可以使用 COCO 格式的數據或自定義數據 (例如 TCGA COAD)。")
 
         with gr.Tabs():
             # ==================  (A) 推理 Tab  ================== #
@@ -751,34 +782,40 @@ def create_gradio_interface(app: ImageCaptioningApp):
 
                 # --- Step 2: parse_coco 產生 pkl ---
                 gr.Markdown("#### Step2. 前處理 (產生 pkl)")
-                gr.Markdown("若您使用自定義數據，請確保遵循COCO格式。")
-
                 with gr.Row():
                     with gr.Column():
+                        # 新增選擇數據類型的控件
+                        data_type_radio = gr.Radio(
+                            label="訓練數據類型", 
+                            choices=["COCO", "TCGA"], 
+                            value="COCO"
+                        )
                         input_dir_box = gr.Textbox(
-                            label="資料路徑 (空白預設: ./data/coco)",
+                            label="資料路徑", 
                             placeholder="./data/coco"
                         )
                         output_dir_box = gr.Textbox(
-                            label="輸出 pkl 目錄 (空白預設: ./data/coco)",
+                            label="輸出 pkl 目錄", 
                             placeholder="./data/coco"
                         )
                         clip_model_type_input = gr.Radio(
-                            label="Clip Model Type",
-                            choices=["ViT-B/32", "RN50", "RN101", "RN50x4"],
+                            label="Clip Model Type", 
+                            choices=["ViT-B/32", "RN50", "RN101", "RN50x4"], 
                             value="ViT-B/32"
                         )
-                        parse_button = gr.Button("Parse (pkl)", variant="primary")
-                    with gr.Column():
-                        parse_output = gr.Textbox(
-                            label="parse 輸出",
-                            lines=6,
-                            interactive=False
+                        parse_button = gr.Button(
+                            "Parse (pkl)", 
+                            variant="primary"
                         )
-
+                    with gr.Column():
+                        data_type_instructions = gr.Markdown(update_parse_instructions("COCO"))
+                        parse_output = gr.Textbox(label="parse 輸出", lines=6, interactive=False)
+                # 更新說明及 placeholder：當用戶切換數據類型時
+                data_type_radio.change(fn=update_parse_instructions, inputs=data_type_radio, outputs=data_type_instructions)
+                data_type_radio.change(fn=update_data_path_placeholders, inputs=data_type_radio, outputs=[input_dir_box, output_dir_box])
                 parse_button.click(
                     fn=app.parse_coco_data,
-                    inputs=[input_dir_box, output_dir_box, clip_model_type_input],
+                    inputs=[input_dir_box, output_dir_box, clip_model_type_input, data_type_radio],
                     outputs=parse_output
                 )
 

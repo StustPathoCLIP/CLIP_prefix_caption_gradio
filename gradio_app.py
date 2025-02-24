@@ -752,7 +752,7 @@ def create_gradio_interface(app: ImageCaptioningApp):
             # ==================  (B) 訓練 Tab  ================== #
             with gr.Tab("訓練"):
                 gr.Markdown("### 步驟1 → 步驟2 → 步驟3")
-                gr.Markdown("您可以使用COCO格式的數據集，或者提供您自己的數據集 (從 Step2. 開始)，只需遵循COCO格式。")
+                gr.Markdown("您可以使用COCO格式的數據集，或者提供您自己的數據集 (從 Step2. 開始)。")
 
                 # --- Step 1: 下載 COCO dataset --- 
                 gr.Markdown("#### Step1. 下載資料 (COCO images + train_captions.json)")

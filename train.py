@@ -393,7 +393,14 @@ def train_generator(dataset: ClipCocoDataset,
     model.train()
 
     optimizer = AdamW(model.parameters(), lr=lr)
-    train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    train_dataloader = DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        drop_last=True,
+        num_workers=4,
+        pin_memory=True
+    )
     scheduler = get_linear_schedule_with_warmup(
         optimizer, 
         num_warmup_steps=warmup_steps, 

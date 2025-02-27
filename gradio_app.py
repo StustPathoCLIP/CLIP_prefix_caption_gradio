@@ -659,6 +659,11 @@ def create_gradio_interface(app: ImageCaptioningApp):
         else:
             return gr.update(interactive=True)
 
+    def refresh_model_list():
+        new_choices = app.get_local_models(directory="pt_model")
+        new_value = new_choices[0] if new_choices else "自定義路徑"
+        return gr.update(choices=new_choices, value=new_value)
+
     with gr.Blocks() as demo:
         gr.Markdown("# CLIP_prefix_caption")
         gr.Markdown("本系統提供 **推理** 和 **訓練** ，您可以使用 COCO 格式的數據或自定義數據 (例如 TCGA COAD)。")
@@ -713,6 +718,14 @@ def create_gradio_interface(app: ImageCaptioningApp):
                             value=("自定義路徑" if not app.get_local_models(directory = "pt_model") else app.get_local_models(directory = "pt_model")[0]),
                             label="選擇本地模型"
                         )
+                        
+                        refresh_model_button = gr.Button("刷新模型路徑", variant="secondary")
+                        refresh_model_button.click(
+                            fn=refresh_model_list,
+                            inputs=[],
+                            outputs=model_selection
+                        )
+
                         custom_model_path = gr.Textbox(
                             label="自定義模型路徑",
                             placeholder="請輸入完整的模型檔案路徑",

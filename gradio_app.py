@@ -678,6 +678,10 @@ def create_gradio_interface(app: ImageCaptioningApp):
         else:
             return stop_choice
 
+    def inference_wrapper(image, model_sel, custom_path, prefix_len, use_beam, beam_sz, top_p_val, temp, stop_choice, custom_token):
+        final_stop = get_final_stop_token(stop_choice, custom_token)
+        yield from app.inference(image, model_sel, custom_path, prefix_len, use_beam, beam_sz, top_p_val, temp, final_stop)
+
     with gr.Blocks() as demo:
         gr.Markdown("# CLIP_prefix_caption")
         gr.Markdown("本系統提供 **推理** 和 **訓練** ，您可以使用 COCO 格式的數據或自定義數據 (例如 TCGA COAD)。")
@@ -772,11 +776,7 @@ def create_gradio_interface(app: ImageCaptioningApp):
                 )
 
                 generate_button.click(
-                    fn=lambda image, model_sel, custom_path, prefix_len, use_beam, beam_sz, top_p_val, temp, stop_choice, custom_token: 
-                        app.inference(
-                            image, model_sel, custom_path, prefix_len, use_beam, beam_sz, top_p_val, temp,
-                            get_final_stop_token(stop_choice, custom_token)
-                        ),
+                    fn=inference_wrapper,
                     inputs=[
                         image_input,
                         model_selection,
@@ -791,6 +791,7 @@ def create_gradio_interface(app: ImageCaptioningApp):
                     ],
                     outputs=output_text
                 )
+
 
             # ==================  (B) 訓練 Tab  ================== #
             with gr.Tab("訓練"):

@@ -664,6 +664,20 @@ def create_gradio_interface(app: ImageCaptioningApp):
         new_value = new_choices[0] if new_choices else "自定義路徑"
         return gr.update(choices=new_choices, value=new_value)
 
+    def update_stop_token_visibility(choice):
+        """依據停止符號選擇，決定是否顯示自訂輸入框。"""
+        if choice == "自訂":
+            return gr.update(visible=True)
+        else:
+            return gr.update(visible=False)
+    
+    def get_final_stop_token(stop_choice, custom_token):
+        """最終停止符號：若選擇自訂，則使用自訂內容；否則使用選擇值。"""
+        if stop_choice == "自訂":
+            return custom_token if custom_token.strip() != "" else stop_choice
+        else:
+            return stop_choice
+
     with gr.Blocks() as demo:
         gr.Markdown("# CLIP_prefix_caption")
         gr.Markdown("本系統提供 **推理** 和 **訓練** ，您可以使用 COCO 格式的數據或自定義數據 (例如 TCGA COAD)。")
@@ -706,10 +720,15 @@ def create_gradio_interface(app: ImageCaptioningApp):
                             step=0.1,
                             value=1.0
                         )
-                        stop_token = gr.Textbox(
-                            label="停止符號 (Stop Token)",
-                            value=".",
-                            lines=1
+                        stop_token_choice = gr.Radio(
+                            label="選擇停止符號",
+                            choices=[".", "<EOS>", "自訂"],
+                            value="."
+                        )
+                        custom_stop_token = gr.Textbox(
+                            label="自訂停止符號",
+                            placeholder="請輸入停止符號",
+                            visible=False
                         )
 
                     with gr.Column():
@@ -746,8 +765,18 @@ def create_gradio_interface(app: ImageCaptioningApp):
                     outputs=top_p
                 )
 
+                stop_token_choice.change(
+                    fn=update_stop_token_visibility,
+                    inputs=stop_token_choice,
+                    outputs=custom_stop_token
+                )
+
                 generate_button.click(
-                    fn=app.inference,
+                    fn=lambda image, model_sel, custom_path, prefix_len, use_beam, beam_sz, top_p_val, temp, stop_choice, custom_token: 
+                        app.inference(
+                            image, model_sel, custom_path, prefix_len, use_beam, beam_sz, top_p_val, temp,
+                            get_final_stop_token(stop_choice, custom_token)
+                        ),
                     inputs=[
                         image_input,
                         model_selection,
@@ -757,7 +786,8 @@ def create_gradio_interface(app: ImageCaptioningApp):
                         beam_size,
                         top_p,
                         temperature,
-                        stop_token
+                        stop_token_choice,
+                        custom_stop_token
                     ],
                     outputs=output_text
                 )

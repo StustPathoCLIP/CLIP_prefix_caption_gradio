@@ -1,6 +1,9 @@
- transformers
-gradio
-clip-by-openai
-Pillow
-numpy
-tqdm
+git+https://github.com/openai/CLIP.git@main#egg=clip
+
+transformers>=4.40
+gradio>=4.25
+Pillow>=10.0
+numpy>=1.23
+tqdm>=4.66
+requests>=2.31
+gdown>=5.0

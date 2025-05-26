@@ -7,6 +7,7 @@ import pickle
 import json
 import os
 import time
+from pathclip_loader import load_pathclip
 
 def parse_coco_gen(input_dir: str, output_dir: str, clip_model_type: str):
     """
@@ -30,7 +31,13 @@ def parse_coco_gen(input_dir: str, output_dir: str, clip_model_type: str):
     例如：image_id "TCGA-3L-AA1B-1" 對應的路徑為 "train/TCGA-3L-AA1B/TCGA-3L-AA1B-1.jpg"
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    clip_model, preprocess = clip.load(clip_model_type, device=device, jit=False)
+
+    # === (A) 挑選影像編碼器 ===
+    if clip_model_type == "PathCLIP":
+        clip_model, preprocess = load_pathclip("pt_model/pathclip-base.pt", device)
+    else:
+        clip_model, preprocess = clip.load(clip_model_type, device=device, jit=False)
+
     
     # 判斷使用哪個 annotation 文件
     tcga_annotation_path = os.path.join(input_dir, 'annotations', 'train_caption_tcgaCOAD.json')

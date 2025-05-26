@@ -844,7 +844,7 @@ def create_gradio_interface(app: ImageCaptioningApp):
                         )
                         clip_model_type_input = gr.Radio(
                             label="Clip Model Type", 
-                            choices=["ViT-B/32", "RN50", "RN101", "RN50x4"], 
+                            choices=["ViT-B/32", "RN50", "RN101", "RN50x4", "PathCLIP"], 
                             value="ViT-B/32"
                         )
                         parse_button = gr.Button(

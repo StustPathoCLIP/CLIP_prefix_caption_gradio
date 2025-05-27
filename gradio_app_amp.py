@@ -8,8 +8,7 @@ import time
 import zipfile
 from PIL import Image
 from transformers import GPT2Tokenizer
-import torchvision
-import torchvision.transforms as T
+from torch.cuda.amp import autocast
 
 # ------ 推理相關 (inference2.py) ------
 from inference import (
@@ -84,15 +83,17 @@ class ImageCaptioningApp:
         custom_model_path: str,
         prefix_length: int,
         use_beam_search: bool,
+        use_amp: bool,
         beam_size: int,
         top_p: float,
         temperature: float,
-        stop_token: str,
-        multi_res_flag,
-        high_size_val
+        stop_token: str
     ):
         """
         使用 yield 分段回傳訊息，以在 Gradio 中即時顯示推理過程。
+        支援：
+          • Beam Search / Nucleus Sampling
+          • AMP (Automatic Mixed Precision) – 只在 GPU 且勾選時啟用
         """
         log = ""
 
@@ -102,19 +103,19 @@ class ImageCaptioningApp:
             yield log
             return
 
+        # 2) 解析 & 檢查模型路徑 ------------------------------------------------
         model_path = self.get_model_path(os.path.join(model_directory, model_selection), custom_model_path)
-
-        # 2) 檢查模型檔案路徑
         if not os.path.isfile(model_path):
             log += f"模型檔案路徑無效：{model_path}\n請確認檔案存在。\n"
             yield log
             return
 
-        # 3) 若尚未載入模型，或 prefix_length / 路徑改變，則重新載入
+        # 3) 判定是否需要重新載入 -------------------------------------------------
         need_reload = (
             self.model_cache["model"] is None
             or self.model_cache["prefix_length"] != prefix_length
             or self.model_cache["model_path"] != model_path
+            or self.model_cache.get("use_amp") != use_amp
         )
         if need_reload:
             log += f"正在載入模型：{model_path} (prefix_length={prefix_length})...\n"
@@ -128,9 +129,10 @@ class ImageCaptioningApp:
                     "preprocess": preprocess,
                     "device": device,
                     "prefix_length": prefix_length,
+                    "use_amp": use_amp,
                     "model_path": model_path
                 })
-                log = "模型載入成功！\n"  # 重置 log 只顯示載入成功的訊息
+                log = "模型載入成功！\n"
                 yield log
             except Exception as e:
                 log += f"模型載入失敗：{str(e)}\n"
@@ -140,69 +142,70 @@ class ImageCaptioningApp:
             log += f"使用快取模型：{model_path}\n"
             yield log
 
-        # 取出快取模型與組件
-        model = self.model_cache["model"]
-        clip_model = self.model_cache["clip_model"]
-        tokenizer = self.model_cache["tokenizer"]
-        preprocess = self.model_cache["preprocess"]
-        device = self.model_cache["device"]
+        # 4) 取出快取 -----------------------------------------------------------
+        model       = self.model_cache["model"]
+        clip_model  = self.model_cache["clip_model"]
+        tokenizer   = self.model_cache["tokenizer"]
+        preprocess  = self.model_cache["preprocess"]
+        device      = self.model_cache["device"]
+
+        # 5) 若開啟 AMP 並且在 CUDA，上下文與權重轉半精度 -------------------------
+        amp_enabled = use_amp and device.type == "cuda"
+        if amp_enabled:
+            model = model.half()
+            clip_model = clip_model.half()
 
         try:
+            # 6) CLIP Encode ----------------------------------------------------
             log = "\n=== 開始 CLIP Encode... ===\n"
             yield log
-            img_low = preprocess(image).unsqueeze(0).to(device)
-            if multi_res_flag:
-                preprocess_high = torchvision.transforms.Compose([
-                    torchvision.transforms.Resize(high_size_val),
-                    torchvision.transforms.CenterCrop(high_size_val),
-                    torchvision.transforms.Resize(preprocess.transforms[0].size),
-                    *preprocess.transforms[1:],
-                ])
-                img_high = preprocess_high(image).unsqueeze(0).to(device)
-            with torch.no_grad():
-                feats_low  = clip_model.encode_image(img_low).float()
-                feats = feats_low
-                if multi_res_flag:
-                    feats_high = clip_model.encode_image(img_high).float()
-                    feats = (feats_low + feats_high) / 2
-                prefix_embed = model.clip_project(feats).reshape(1, prefix_length, -1)
+            image_tensor = preprocess(image).unsqueeze(0).to(device)
+            if amp_enabled:
+                image_tensor = image_tensor.half()
 
-            # 5) 文字生成
-            if use_beam_search:
-                log = f"\n=== 使用 Beam Search (beam_size={beam_size}) 生成描述... ===\n"
-                yield log
-                output_text = generate_beam(
-                    model=model,
-                    tokenizer=tokenizer,
-                    beam_size=beam_size,
-                    embed=prefix_embed,
-                    entry_length=67,
-                    temperature=temperature,
-                    stop_token=stop_token
-                )[0]
-            else:
-                log = f"\n=== 使用 Nucleus Sampling (top_p={top_p}, temperature={temperature}) 生成描述... ===\n"
-                yield log
-                output_text = generate2(
-                    model=model,
-                    tokenizer=tokenizer,
-                    embed=prefix_embed,
-                    entry_count=1,
-                    entry_length=67,
-                    top_p=top_p,
-                    temperature=temperature,
-                    stop_token=stop_token
-                )
+            with torch.no_grad(), autocast(enabled=amp_enabled):
+                prefix = clip_model.encode_image(image_tensor)
+                prefix_embed = model.clip_project(prefix).reshape(1, prefix_length, -1)
 
-            # 直接將推理結果覆蓋到輸出框，避免附加
-            log = output_text
+            log = "✔ CLIP Encode 完成！\n"
+            yield log
+
+            # 7) 文字生成 -------------------------------------------------------
+            with autocast(enabled=amp_enabled):
+                if use_beam_search:
+                    log = f"\n=== 使用 Beam Search (beam_size={beam_size}) 生成描述... ===\n"
+                    yield log
+                    output_text = generate_beam(
+                        model=model,
+                        tokenizer=tokenizer,
+                        beam_size=beam_size,
+                        embed=prefix_embed,
+                        entry_length=67,
+                        temperature=temperature,
+                        stop_token=stop_token
+                    )[0]
+                else:
+                    log = f"\n=== 使用 Nucleus Sampling (top_p={top_p}, temperature={temperature}) 生成描述... ===\n"
+                    yield log
+                    output_text = generate2(
+                        model=model,
+                        tokenizer=tokenizer,
+                        embed=prefix_embed,
+                        entry_count=1,
+                        entry_length=67,
+                        top_p=top_p,
+                        temperature=temperature,
+                        stop_token=stop_token
+                    )
+
+            # 8) 輸出結果 -------------------------------------------------------
+            log = output_text            # 覆蓋 log，只顯示結果
             yield log
 
         except Exception as e:
             log = f"生成過程發生錯誤：{str(e)}\n"
             yield log
             return
-
 
 
     # ===============  2. 訓練  ===============
@@ -685,9 +688,19 @@ def create_gradio_interface(app: ImageCaptioningApp):
         else:
             return stop_choice
 
-    def inference_wrapper(image, model_sel, custom_path, prefix_len, use_beam, beam_sz, top_p_val, temp, stop_choice, custom_token, multi_res_flag, high_size_val):
+    def inference_wrapper(
+        image, model_sel, custom_path, prefix_len,
+        use_beam, use_amp,              # ➊ 新增 use_amp，緊跟用戶體感上相關的選項
+        beam_sz, top_p_val, temp,
+        stop_choice, custom_token
+    ):
         final_stop = get_final_stop_token(stop_choice, custom_token)
-        yield from app.inference(image, model_sel, custom_path, prefix_len, use_beam, beam_sz, top_p_val, temp, final_stop, multi_res_flag, high_size_val)
+        yield from app.inference(
+            image, model_sel, custom_path, prefix_len,
+            use_beam, use_amp,          # ➋ 轉交給底層
+            beam_sz, top_p_val, temp,
+            final_stop
+        )
 
     with gr.Blocks() as demo:
         gr.Markdown("# CLIP_prefix_caption")
@@ -706,22 +719,13 @@ def create_gradio_interface(app: ImageCaptioningApp):
                             value=10,
                             precision=0
                         )
-                        # === Multi-Res 控制 ===
-                        multi_res_checkbox = gr.Checkbox(
-                            label="啟用多解析度推理 (224 + high-res)",
-                            value=False
-                        )
-                        high_size_slider = gr.Slider(
-                            label="高解析度邊長 (先裁切 → 再縮回 224)",
-                            minimum=300,
-                            maximum=800,
-                            step=32,
-                            value=448,
-                            visible=True
-                        )
                         use_beam_search = gr.Checkbox(
                             label="使用 Beam Search",
                             value=False
+                        )
+                        use_amp = gr.Checkbox(
+                            label="啟用 AMP (FP16)",
+                            value=True
                         )
                         beam_size = gr.Slider(
                             label="Beam Size",
@@ -775,7 +779,6 @@ def create_gradio_interface(app: ImageCaptioningApp):
                             visible=False
                         )
                         output_text = gr.Textbox(label="生成的描述", lines=5)
-                        
                         generate_button = gr.Button("產生描述", variant="primary")
 
                 model_selection.change(
@@ -804,13 +807,12 @@ def create_gradio_interface(app: ImageCaptioningApp):
                         custom_model_path,
                         prefix_length,
                         use_beam_search,
+                        use_amp,
                         beam_size,
                         top_p,
                         temperature,
                         stop_token_choice,
-                        custom_stop_token,
-                        multi_res_checkbox,
-                        high_size_slider
+                        custom_stop_token
                     ],
                     outputs=output_text
                 )

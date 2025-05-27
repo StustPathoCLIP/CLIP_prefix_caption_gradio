@@ -9,6 +9,8 @@ from transformers import GPT2Tokenizer, GPT2LMHeadModel
 from tqdm import trange
 import clip
 
+from pathclip_loader import load_pathclip
+
 #####################################
 # 1. 定義模型結構
 #####################################
@@ -231,59 +233,128 @@ def filter_state_dict(state_dict, model):
     
     return filtered_state_dict
 
+def smart_load_checkpoint(model_path, prefix_length, device):
+    """根據檔案內容，自動載回 (caption_model, clip_model, preprocess)。"""
+    ckpt = torch.load(model_path, map_location="cpu")
+    
+    # 判斷格式：End-to-End (= 有 caption_state_dict)
+    is_end2end = isinstance(ckpt, dict) and "caption_state_dict" in ckpt
+    
+    # 1) Caption model --------------------------------------------------
+    caption_model = ClipCaptionModel(prefix_length=prefix_length)
+    if is_end2end:
+        caption_sd = ckpt["caption_state_dict"]
+    else:
+        caption_sd = ckpt
+    caption_model.load_state_dict(filter_state_dict(caption_sd, caption_model), strict=False)
+    caption_model.eval().to(device)
+    
+    # 2) CLIP / PathCLIP encoder ---------------------------------------
+    if is_end2end and "clip_state_dict" in ckpt:
+        clip_model, preprocess = load_pathclip()           # local base weights
+        clip_model.load_state_dict(
+            {k: v for k, v in ckpt["clip_state_dict"].items() if k in clip_model.state_dict()},
+            strict=False
+        )
+    else:
+        clip_model, preprocess = clip.load("ViT-B/32", device=device, jit=False)
+    clip_model.eval().to(device)
+
+    return caption_model, clip_model, preprocess
+
 
 def main():
-    parser = argparse.ArgumentParser(description="CLIP Prefix Caption Inference (matching original ipynb logic)")
-    parser.add_argument('--image_path', required=True, type=str, help="Path to the input image")
-    parser.add_argument('--model_path', required=True, type=str, help="Path to the pretrained model weights")
-    parser.add_argument('--device', default="cuda", type=str, help="Device to use (cpu or cuda)")
-    parser.add_argument('--prefix_length', default=10, type=int, help="Prefix length used in training")
-    parser.add_argument('--use_beam_search', action='store_true', help="Whether to use beam search or nucleus sampling")
+    """
+    Inference entry-point  
+    ‣ 自動相容 ① 傳統 prefix-only  ② PathCLIP End-to-End checkpoint  
+    ‣ 支援 beam search / nucleus sampling  
+    ‣ ★ 新增 --multi_res / --high_size：推理時同時用高解析度視野
+    """
+    import argparse, os
+    parser = argparse.ArgumentParser("CLIP Prefix Caption Inference")
+    parser.add_argument("--image_path",   required=True,  help="Path to input image")
+    parser.add_argument("--model_path",   required=True,  help="Path to .pt / .pth checkpoint")
+    parser.add_argument("--device",       default="cuda", help="cuda / cpu (auto-fallback)")
+    parser.add_argument("--prefix_length",default=10,     type=int, help="Prefix length used in training")
+    parser.add_argument("--use_beam_search",action="store_true", help="Use beam search instead of nucleus sampling")
+    parser.add_argument("--beam_size",    default=5,      type=int, help="Beam size when --use_beam_search")
+    parser.add_argument("--top_p",        default=0.8,    type=float, help="Top-p for nucleus sampling")
+    parser.add_argument("--temperature",  default=1.0,    type=float, help="Sampling temperature")
+    parser.add_argument("--stop_token",   default=".",    help="Generation stop token")
+    # ── ★ 多解析度旗標 ───────────────────────────
+    parser.add_argument("--multi_res",  action="store_true",
+                        help="啟用多解析度 (低224 + 高解析度) 雙路推理")
+    parser.add_argument("--high_size",  type=int, default=448,
+                        help="高解析度路徑先裁成多少邊長再縮回 224 (需搭配 --multi_res)")
     args = parser.parse_args()
 
-    # 選擇硬體裝置
+    # ── 1. 裝置 ─────────────────────────────────
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
-    # 載入 CLIP 模型
-    clip_model, preprocess = clip.load("ViT-B/32", device=device, jit=False)
+    # ── 2. 讀取模型 (PathCLIP / Prefix-only 自動判斷) ─
+    caption_model, clip_model, preprocess = smart_load_checkpoint(
+        model_path     = args.model_path,
+        prefix_length  = args.prefix_length,
+        device         = device,
+    )
 
-    # 載入 GPT-2 的 tokenizer
+    # ── 3. Tokenizer ───────────────────────────
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
 
-    # 建立 ClipCaptionModel
-    model = ClipCaptionModel(prefix_length=args.prefix_length)
-
-    # 載入權重，手動刪除多餘的部分
-    print("Loading model weights...")
-    raw_state_dict = torch.load(args.model_path, map_location="cpu", weights_only=True)
-    filtered_state_dict = filter_state_dict(raw_state_dict, model)  # 手動過濾多餘權重
-    model.load_state_dict(filtered_state_dict)  # 不使用 strict=False
-    print("Model weights loaded successfully!")
-    
-    # 設置模型為評估模式
-    model.eval()
-    model = model.to(device)
-
-    # 讀取圖像
+    # ── 4. 影像前處理 → CLIP 特徵 (支援多解析度) ────
+    from PIL import Image
+    from torchvision import transforms as T          # 避免改動全域 import
     pil_image = Image.open(args.image_path).convert("RGB")
-    image_tensor = preprocess(pil_image).unsqueeze(0).to(device)
 
-    # CLIP encode -> prefix
+    # 低解析度 (224×224) 視野
+    img_low = preprocess(pil_image).unsqueeze(0).to(device)
+
+    # 若開啟 --multi_res，再做一條高解析度視野
+    if args.multi_res:
+        preprocess_high = T.Compose([
+            T.Resize(args.high_size),
+            T.CenterCrop(args.high_size),
+            T.Resize(preprocess.transforms[0].size),   # 縮回 224
+            *preprocess.transforms[1:],               # Normalize / ToTensor
+        ])
+        img_high = preprocess_high(pil_image).unsqueeze(0).to(device)
+
+    # —— CLIP encode & 融合 ——
     with torch.no_grad():
-        prefix = clip_model.encode_image(image_tensor).to(device, dtype=torch.float32)
-        prefix_embed = model.clip_project(prefix).reshape(1, args.prefix_length, -1)
+        feats_low = clip_model.encode_image(img_low).to(dtype=torch.float32)
+        if args.multi_res:
+            feats_high = clip_model.encode_image(img_high).to(dtype=torch.float32)
+            clip_feat = (feats_low + feats_high) / 2          # 簡單平均融合
+        else:
+            clip_feat = feats_low
 
-    # 生成文字
+        prefix_embed = caption_model.clip_project(clip_feat)\
+                                    .view(1, args.prefix_length, -1)
+
+    # ── 5. 產生 Caption ──────────────────────────
     if args.use_beam_search:
-        # beam search
-        generated_text = generate_beam(model, tokenizer, embed=prefix_embed, beam_size=5)[0]
+        caption = generate_beam(
+            model      = caption_model,
+            tokenizer  = tokenizer,
+            embed      = prefix_embed,
+            beam_size  = args.beam_size,
+            temperature= args.temperature,
+            stop_token = args.stop_token
+        )[0]
     else:
-        # nucleus sampling
-        generated_text = generate2(model, tokenizer, embed=prefix_embed)
+        caption = generate2(
+            model       = caption_model,
+            tokenizer   = tokenizer,
+            embed       = prefix_embed,
+            entry_length= 67,
+            top_p       = args.top_p,
+            temperature = args.temperature,
+            stop_token  = args.stop_token
+        )
 
-    # 輸出結果
-    print("Generated caption:\n", generated_text)
-
+    # ── 6. 輸出結果 ──────────────────────────────
+    print("\nGenerated caption:")
+    print(caption)
 
 if __name__ == "__main__":
     main()

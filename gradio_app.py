@@ -10,6 +10,7 @@ from PIL import Image
 from transformers import GPT2Tokenizer
 import torchvision
 import torchvision.transforms as T
+import numpy as np
 
 # ------ 推理相關 (inference2.py) ------
 from inference import (
@@ -28,6 +29,11 @@ try:
     from parse_coco import parse_coco
 except ImportError:
     parse_coco = None
+
+from visualization import grad_to_heatmap, overlay_heatmap
+
+MEAN = [0.48145466, 0.4578275, 0.40821073]
+STD  = [0.26862954, 0.26130258, 0.27577711]
 
 model_directory = "pt_model"
 
@@ -202,6 +208,54 @@ class ImageCaptioningApp:
             log = f"生成過程發生錯誤：{str(e)}\n"
             yield log
             return
+
+    @staticmethod
+    def _denorm_to_pil(t: torch.Tensor) -> Image.Image:
+        arr = t.detach().cpu().numpy().transpose(1, 2, 0)        # H,W,C
+        arr = arr * np.array(STD) + np.array(MEAN)
+        arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
+        return Image.fromarray(arr)
+
+    def explain(self, image: Image.Image, prefix_length: int):
+        """
+        產生梯度熱力圖 (saliency overlay)
+        ── 若模型尚未載入，直接回傳提示文字，不丟例外 ──
+        """
+        # 0) 必須先上傳圖片
+        if image is None:
+            return None, "請先上傳圖片"
+
+        # 1) 檢查模型是否完成初始化
+        preprocess = self.model_cache.get("preprocess", None)
+        clip_m     = self.model_cache.get("clip_model",  None)
+        cap_m      = self.model_cache.get("model",       None)
+        device     = self.model_cache.get("device",      None)
+
+        if preprocess is None or clip_m is None or cap_m is None:
+            # －－模型尚未載入：給使用者友善提示，不做任何計算－－
+            return None, "請先載入 / 選擇模型，或先執行一次『產生描述』"
+
+        # 2) 前處理＋允許梯度
+        img_t = preprocess(image).unsqueeze(0).to(device)   # [1,3,H,W]
+        img_t.requires_grad_(True)
+        H, W = img_t.shape[-2:]
+
+        # 3) 前向 (保持計算圖)
+        feat   = clip_m.encode_image(img_t).float()
+        prefix = cap_m.clip_project(feat).view(1, prefix_length, -1)
+        out    = cap_m.gpt(inputs_embeds=prefix)
+
+        # 4) backward 取得梯度
+        logprob = out.logits[0, -1].log_softmax(-1).max()
+        logprob.backward()
+
+        # 5) 產生熱力圖並疊回原圖
+        heat = grad_to_heatmap(img_t.grad.squeeze(), (H, W))
+        orig = self._denorm_to_pil(img_t.squeeze())
+        vis  = overlay_heatmap(orig, heat)
+
+        # 6) 正常回傳 (圖片 + 狀態文字)
+        return vis, "梯度熱力圖已生成！"
 
 
 
@@ -706,6 +760,7 @@ def create_gradio_interface(app: ImageCaptioningApp):
                             value=10,
                             precision=0
                         )
+
                         # === Multi-Res 控制 ===
                         multi_res_checkbox = gr.Checkbox(
                             label="啟用多解析度推理 (224 + high-res)",
@@ -756,12 +811,16 @@ def create_gradio_interface(app: ImageCaptioningApp):
                         )
 
                     with gr.Column():
+                        # （1）模型選擇相關
                         model_selection = gr.Dropdown(
-                            choices=app.get_local_models(directory = "pt_model"),
-                            value=("自定義路徑" if not app.get_local_models(directory = "pt_model") else app.get_local_models(directory = "pt_model")[0]),
+                            choices=app.get_local_models(directory="pt_model"),
+                            value=(
+                                "自定義路徑" 
+                                if not app.get_local_models(directory="pt_model") 
+                                else app.get_local_models(directory="pt_model")[0]
+                            ),
                             label="選擇本地模型"
                         )
-                        
                         refresh_model_button = gr.Button("刷新模型路徑", variant="secondary")
                         refresh_model_button.click(
                             fn=refresh_model_list,
@@ -774,9 +833,37 @@ def create_gradio_interface(app: ImageCaptioningApp):
                             placeholder="請輸入完整的模型檔案路徑",
                             visible=False
                         )
-                        output_text = gr.Textbox(label="生成的描述", lines=5)
-                        
+
+                        # （2）文字描述輸出框
+                        output_text = gr.Textbox(
+                            label="生成的描述",
+                            lines=5
+                        )
+
+                        # （3）按鈕：產生描述
                         generate_button = gr.Button("產生描述", variant="primary")
+                        generate_button.click(
+                            fn=lambda img, pl, mp: app.generate2(img, pl, mp),
+                            inputs=[image_input, prefix_length, custom_model_path],
+                            outputs=output_text
+                        )
+
+                        # （4）熱力圖與狀態輸出
+                        heatmap_output = gr.Image(
+                            label="模型關注的區域（熱力圖）"
+                        )
+                        explain_status = gr.Textbox(
+                            label="熱力圖狀態",
+                            interactive=False,
+                            lines=1,
+                            value=""              # 預設空白
+                        )
+                        explain_btn = gr.Button("產生熱力圖", variant="secondary")
+                        explain_btn.click(
+                            fn=lambda img, pl: app.explain(img, pl),
+                            inputs=[image_input, prefix_length],
+                            outputs=[heatmap_output, explain_status]
+                        )
 
                 model_selection.change(
                     fn=update_custom_path_visibility,

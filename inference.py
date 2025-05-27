@@ -8,8 +8,20 @@ from PIL import Image
 from transformers import GPT2Tokenizer, GPT2LMHeadModel
 from tqdm import trange
 import clip
+from visualization import grad_to_heatmap, overlay_heatmap
+import cv2
+import numpy as np
 
 from pathclip_loader import load_pathclip
+
+MEAN = [0.48145466, 0.4578275, 0.40821073]
+STD  = [0.26862954, 0.26130258, 0.27577711]
+
+def denorm_to_pil(t: torch.Tensor) -> Image.Image:
+    arr = t.detach().cpu().numpy().transpose(1, 2, 0)
+    arr = arr * np.array(STD) + np.array(MEAN)
+    arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
 
 #####################################
 # 1. 定義模型結構
@@ -286,6 +298,8 @@ def main():
                         help="啟用多解析度 (低224 + 高解析度) 雙路推理")
     parser.add_argument("--high_size",  type=int, default=448,
                         help="高解析度路徑先裁成多少邊長再縮回 224 (需搭配 --multi_res)")
+    parser.add_argument("--explain", action="store_true",
+                    help="同時輸出梯度熱力圖 (saliency.png)")
     args = parser.parse_args()
 
     # ── 1. 裝置 ─────────────────────────────────
@@ -355,6 +369,32 @@ def main():
     # ── 6. 輸出結果 ──────────────────────────────
     print("\nGenerated caption:")
     print(caption)
+
+    if args.explain:
+        # 1) 前處理 + 允許梯度
+        pil_img = Image.open(args.image_path).convert("RGB")
+        img_t   = preprocess(pil_img).unsqueeze(0).to(device)
+        img_t.requires_grad_(True)
+        H, W = img_t.shape[-2:]                                  # 224, 224
+
+        # 2) 前向 (保留計算圖)
+        feat   = clip_model.encode_image(img_t).float()
+        prefix = caption_model.clip_project(feat).view(1, args.prefix_length, -1)
+        out    = caption_model.gpt(inputs_embeds=prefix)
+
+        # 3) backward
+        logprob = out.logits[0, -1].log_softmax(-1).max()
+        logprob.backward()
+
+        # 4) 熱力圖 (224×224)
+        heat = grad_to_heatmap(img_t.grad.squeeze(), (H, W))
+        orig = denorm_to_pil(img_t.squeeze())                    # 224×224
+        vis  = overlay_heatmap(orig, heat)
+
+        # 5) 存檔
+        out_name = "saliency.png"
+        cv2.imwrite(out_name, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+        print(f"✔ 已輸出梯度熱力圖：{out_name}")
 
 if __name__ == "__main__":
     main()
